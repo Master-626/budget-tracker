@@ -1,0 +1,44 @@
+name: Test
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            python: '3.8'
+          - os: ubuntu-latest
+            python: '3.12'
+          - os: ubuntu-latest
+            python: '3.14'
+          - os: macos-latest
+            python: '3.12'
+          - os: windows-latest
+            python: '3.12'
+          - os: ubuntu-22.04
+            python: '3.8'
+            minimum: true
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install minimum dependencies
+        if: matrix.minimum
+        run: python -m pip install click==8.0.0 rich==13.0.0
+      - name: Install development tools
+        run: python -m pip install '.[dev]' build
+      - name: Test
+        run: python -m pytest -q
+      - name: Build
+        run: python -m build
+      - name: Install wheel
+        run: python -m pip install --force-reinstall --no-deps dist/budget_tracker-0.2.0-py3-none-any.whl
+      - name: Test installed entry point
+        run: python scripts/wheel_smoke.py
