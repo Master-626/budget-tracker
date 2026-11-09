@@ -145,8 +145,13 @@ def test_default_path_environment_and_explicit_precedence(tmp_path, monkeypatch)
     assert len(Ledger(env_path).records()) == 1
 
 
-def test_path_with_uri_characters(tmp_path):
-    db = tmp_path / "子 directory" / "a?b# c.sqlite3"
+@pytest.mark.parametrize("filename", [
+    "a%25# c.sqlite3",
+    pytest.param("a?b# c.sqlite3", marks=pytest.mark.skipif(
+        os.name == "nt", reason="Windows filenames cannot contain a question mark")),
+])
+def test_path_with_uri_characters(tmp_path, filename):
+    db = tmp_path / "子 directory" / filename
     assert run(db, "expense", "1").exit_code == 0
     assert Ledger(db).summary()[2] == 100
 
