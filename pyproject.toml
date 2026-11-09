@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "budget-tracker"
-version = "0.1.0"
-description = "A personal budget and expense tracking CLI with reports and budgets."
+version = "0.2.0"
+description = "A local USD income and expense ledger with exact totals."
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "MIT" }
@@ -17,3 +17,13 @@ budget = "budget_tracker.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/Master-626/budget-tracker"
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/budget_tracker"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
