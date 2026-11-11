@@ -1,9 +1,9 @@
 """Smoke-test the installed wheel and entry point outside the source directory."""
 import os
-from pathlib import Path
 import subprocess
 import sysconfig
 import tempfile
+from pathlib import Path
 
 
 def main():
@@ -23,7 +23,7 @@ def main():
             if result.returncode:
                 raise AssertionError(result.stderr)
             return result.stdout
-        assert "0.2.0" in run("--version")
+        assert "0.2.1" in run("--version")
         assert "No recorded transactions" in run("summary")
         assert not db.exists()
         assert "Added expense #1" in run("expense", "0.10", "-c", "food")
@@ -34,6 +34,17 @@ def main():
         assert "Recorded expenses: $0.30 USD" in output
         assert "Recorded income: $1.00 USD" in output
         assert "Recorded net: $0.70 USD" in output
+        food = run("summary", "--category", "food")
+        assert "Category filter: food" in food
+        assert "Recorded expenses: $0.30 USD" in food
+        assert "Recorded income: $0.00 USD" in food
+        assert "salary" not in food
+        salary = run("list", "--category", "salary")
+        assert "#3 | income | $1.00 USD | salary" in salary
+        assert "food" not in salary
+        long_name = "n" * 90
+        assert long_name in run("expense", "1.25", "-c", long_name)
+        assert long_name in run("summary")
         print("Installed-wheel CLI smoke passed: persistence, exact amounts, income, list, summary.")
 
 

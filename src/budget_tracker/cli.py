@@ -3,6 +3,7 @@ from functools import wraps
 from pathlib import Path
 
 import click
+from rich.cells import cell_len
 from rich.console import Console
 from rich.table import Table
 from rich.text import Text
@@ -23,10 +24,46 @@ def amount_option(ctx, param, value):
 
 
 def category_option(ctx, param, value):
+    if value is None:
+        return None
     try:
         return clean_category(value)
     except ValueError as error:
         raise click.BadParameter(str(error), ctx=ctx, param=param) from None
+
+
+def summary_console(title, categories, file=None, force_terminal=None):
+    """Build a console wide enough to show every category and amount.
+
+    On a real terminal, Rich ignores an explicit width unless height is set,
+    then ellipsizes cells to the detected terminal width. Distinct long
+    category names would otherwise look identical.
+    """
+    longest_name = max(cell_len(name) for name in categories)
+    longest_amount = 0
+    for incoming, outgoing in categories.values():
+        longest_amount = max(
+            longest_amount, len(format_amount(incoming)), len(format_amount(outgoing))
+        )
+    name_width = max(cell_len("Category"), longest_name)
+    amount_width = max(cell_len("Income"), cell_len("Expenses"), longest_amount)
+    # Padding inside each column, plus the four box-drawing edges.
+    width = max(80, cell_len(title) + 4, name_width + amount_width * 2 + 24)
+    height = len(categories) + 16
+    return Console(
+        file=file, width=width, height=height, soft_wrap=True, force_terminal=force_terminal,
+    )
+
+
+def print_category_table(categories, file=None, force_terminal=None):
+    title = "Recorded transactions (USD, all time)"
+    table = Table(title=title)
+    table.add_column("Category", no_wrap=True, overflow="ignore")
+    table.add_column("Income", justify="right", no_wrap=True, overflow="ignore")
+    table.add_column("Expenses", justify="right", no_wrap=True, overflow="ignore")
+    for name, (incoming, outgoing) in sorted(categories.items()):
+        table.add_row(Text(name), format_amount(incoming), format_amount(outgoing))
+    summary_console(title, categories, file=file, force_terminal=force_terminal).print(table)
 
 
 def ledger_errors(function):
@@ -78,21 +115,21 @@ def income(ledger, amount, category):
 
 
 @main.command()
+@click.option("--category", "-c", callback=category_option,
+              help="Limit totals to this case-sensitive category.")
 @click.pass_obj
 @ledger_errors
-def summary(ledger):
+def summary(ledger, category):
     """Show all-time totals from recorded transactions, grouped by category."""
-    categories, total_income, total_expenses, count = ledger.summary()
+    categories, total_income, total_expenses, count = ledger.summary(category)
     if categories:
-        table = Table(title="Recorded transactions (USD, all time)")
-        table.add_column("Category")
-        table.add_column("Income", justify="right")
-        table.add_column("Expenses", justify="right")
-        for category, (incoming, outgoing) in sorted(categories.items()):
-            table.add_row(Text(category), format_amount(incoming), format_amount(outgoing))
-        Console().print(table)
-    else:
+        if category is not None:
+            click.echo("Category filter: {}".format(category))
+        print_category_table(categories)
+    elif category is None:
         click.echo("No recorded transactions.")
+    else:
+        click.echo("No recorded transactions for category {}.".format(category))
     click.echo("Transactions: {}".format(count))
     click.echo("Recorded income: {} USD".format(format_amount(total_income)))
     click.echo("Recorded expenses: {} USD".format(format_amount(total_expenses)))
@@ -101,18 +138,25 @@ def summary(ledger):
 
 
 @main.command(name="list")
+@click.option("--category", "-c", callback=category_option,
+              help="Limit the list to this case-sensitive category.")
 @click.pass_obj
 @ledger_errors
-def list_transactions(ledger):
+def list_transactions(ledger, category):
     """List recorded transactions with their IDs and UTC recording times."""
-    rows = ledger.records()
+    rows = ledger.records(category)
     if not rows:
-        click.echo("No recorded transactions.")
+        if category is None:
+            click.echo("No recorded transactions.")
+        else:
+            click.echo("No recorded transactions for category {}.".format(category))
         return
+    if category is not None:
+        click.echo("Category filter: {}".format(category))
     # Plain lines keep IDs and exact amounts readable even in narrow terminals.
-    for row_id, kind, cents, category, created in rows:
+    for row_id, kind, cents, name, created in rows:
         click.echo("#{} | {} | {} USD | {} | {}".format(
-            row_id, kind, format_amount(cents), category, created))
+            row_id, kind, format_amount(cents), name, created))
 
 
 if __name__ == "__main__":

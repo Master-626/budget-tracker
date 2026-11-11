@@ -1,14 +1,17 @@
 """Local, transactional USD ledger. Amounts are integer cents, never floats."""
-from contextlib import contextmanager
-from datetime import datetime, timezone
 import os
-from pathlib import Path
 import re
 import sqlite3
 import stat
 import unicodedata
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
 
 MAX_CENTS = (1 << 63) - 1
+# Longer than the biggest in-range amount (20 characters) so leading zeros are
+# still accepted, and short enough to reject a huge string before int().
+MAX_AMOUNT_INPUT = 128
 APPLICATION_ID = 0x42554447
 SCHEMA_VERSION = 1
 CREATE_TABLE = """CREATE TABLE transactions (
@@ -26,7 +29,7 @@ class LedgerError(Exception):
 
 def parse_amount(value):
     """Parse a positive ASCII decimal USD amount without rounding."""
-    if not isinstance(value, str) or len(value) > 20 or not re.fullmatch(
+    if not isinstance(value, str) or len(value) > MAX_AMOUNT_INPUT or not re.fullmatch(
         r"[0-9]+(?:\.[0-9]{1,2})?", value
     ):
         raise ValueError("Use a positive USD amount with at most two decimal places, e.g. 25.50.")
@@ -44,6 +47,8 @@ def format_amount(cents):
 
 
 def clean_category(value):
+    if not isinstance(value, str):
+        raise ValueError("Category must contain 1 to 100 characters without control characters.")
     value = value.strip()
     if not value or len(value) > 100 or any(unicodedata.category(c).startswith("C") for c in value):
         raise ValueError("Category must contain 1 to 100 characters without control characters.")
@@ -88,16 +93,22 @@ class Ledger:
         objects = connection.execute(
             "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY name"
         ).fetchall()
-        if initialize and (app_id, version, objects) == (0, 0, []):
+        empty = (app_id, version, objects) == (0, 0, [])
+        if initialize and empty:
             connection.execute(CREATE_TABLE)
             connection.execute("PRAGMA application_id = {}".format(APPLICATION_ID))
             connection.execute("PRAGMA user_version = {}".format(SCHEMA_VERSION))
+        elif empty:
+            # A zero-byte or header-only file has no rows. Reads must not
+            # initialize or rewrite it; the next successful write does.
+            pass
         elif (app_id != APPLICATION_ID or version != SCHEMA_VERSION or objects != [
             ("table", "transactions", "transactions", CREATE_TABLE)
         ]):
             raise LedgerError("Unsupported ledger format or schema; the file was not changed.")
         if connection.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
             raise LedgerError("Ledger integrity check failed; the file was not changed.")
+        return not empty or initialize
 
     @contextmanager
     def _connect(self, write=False):
@@ -105,7 +116,7 @@ class Ledger:
         try:
             exists = self._regular_file()
             if not exists and not write:
-                yield None
+                yield (None, False)
                 return
             if write and not exists:
                 self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -125,8 +136,8 @@ class Ledger:
             if write:
                 connection.execute("PRAGMA synchronous = FULL")
             connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
-            self._validate(connection, initialize=write)
-            yield connection
+            ready = self._validate(connection, initialize=write)
+            yield (connection, ready)
             connection.commit()
         except (OSError, sqlite3.Error) as error:
             raise LedgerError("Could not access the ledger: {}".format(error)) from error
@@ -145,8 +156,8 @@ class Ledger:
                     ) from error
 
     @staticmethod
-    def _records(connection):
-        if connection is None:
+    def _records(connection, ready=True):
+        if connection is None or not ready:
             return []
         rows = connection.execute(
             "SELECT id, kind, amount_cents, category, created_at FROM transactions ORDER BY id"
@@ -155,9 +166,14 @@ class Ledger:
             _validate_record(row)
         return rows
 
-    def records(self):
-        with self._connect() as connection:
-            return self._records(connection)
+    def records(self, category=None):
+        if category is not None:
+            category = clean_category(category)
+        with self._connect() as (connection, ready):
+            rows = self._records(connection, ready)
+        if category is None:
+            return rows
+        return [row for row in rows if row[3] == category]
 
     def add(self, kind, cents, category):
         if kind not in ("expense", "income"):
@@ -166,8 +182,8 @@ class Ledger:
             raise ValueError("Amount must be a positive integer number of cents within the supported range.")
         category = clean_category(category)
         created = datetime.now(timezone.utc).isoformat(timespec="microseconds")
-        with self._connect(write=True) as connection:
-            self._records(connection)  # Refuse to append to inconsistent existing data.
+        with self._connect(write=True) as (connection, ready):
+            self._records(connection, ready)  # Refuse to append to inconsistent existing data.
             cursor = connection.execute(
                 "INSERT INTO transactions(kind, amount_cents, category, created_at) VALUES (?, ?, ?, ?)",
                 (kind, cents, category, created),
@@ -176,12 +192,12 @@ class Ledger:
         # Only acknowledge after COMMIT has succeeded.
         return transaction_id
 
-    def summary(self):
-        rows = self.records()
+    def summary(self, category=None):
+        rows = self.records(category)
         grouped = {}
         income = expenses = 0
-        for _, kind, cents, category, _ in rows:
-            bucket = grouped.setdefault(category, [0, 0])
+        for _, kind, cents, name, _ in rows:
+            bucket = grouped.setdefault(name, [0, 0])
             if kind == "income":
                 bucket[0] += cents
                 income += cents

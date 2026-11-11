@@ -1,5 +1,11 @@
 # Budget Tracker
 
+## 简介
+
+Budget Tracker 是一个本地命令行账本，用来记录美元收入和支出。金额按「分」用整数计算，避免浮点误差；数据保存在本机 SQLite 文件中，不需要账号、网络或银行连接。「记录净额」是已记录收入减去已记录支出，不是银行余额。
+
+常用命令：`budget expense 12.50 -c food`（支出）、`budget income 1000 -c salary`（收入）、`budget list`（明细）、`budget summary`（汇总）。`--category` / `-c` 可以只看某一个分类；`--db` 用来指定账本文件。安装、选项和测试方法见下文英文说明。
+
 A small, local command-line ledger for recorded **USD** income and expenses.
 Python 3.8 or newer. Data is stored in SQLite on your computer; no account,
 network connection, or server is needed.
@@ -9,6 +15,7 @@ network connection, or server is needed.
 - Record positive expenses and income with a category.
 - List saved transactions, their IDs, and UTC recording times.
 - Show all-time income, expense, and net totals, including totals by category.
+- Limit `list` and `summary` to one category with `--category` or `-c`.
 - Preserve records across command invocations using SQLite transactions.
 - Calculate with integer cents, without floating-point rounding.
 
@@ -35,18 +42,29 @@ budget expense 3.75 -c transport
 budget income 1000 -c salary
 budget list
 budget summary
+budget list --category food
+budget summary -c salary
 ```
 
 An empty ledger displays zero recorded totals and no example transactions. Read
 commands do not create a missing database. Categories default to `other`; leading
 and trailing whitespace is trimmed. Category names are case-sensitive, contain
-at most 100 characters, and must not contain control characters.
+at most 100 characters, and must not contain control characters. `summary`
+prints every category name in full, including names that do not fit in a narrow
+terminal. `list --category food` and `summary -c food` include only that
+category; other categories stay in the ledger and are omitted from the output.
+The filtered totals are not the whole-ledger totals. An unknown category prints
+no rows and zero totals. Invalid category text is rejected and does not change
+the file. Filtering still checks every stored row, so an invalid row in another
+category is not hidden.
 
 Amounts must be positive USD decimals with no more than two fractional digits,
-for example `12`, `12.3`, or `12.34`. Zero, negative values, scientific notation,
-commas, currency symbols, non-finite values, and extra decimal places are rejected
-rather than silently rounded. One transaction can contain at most
-`92233720368547758.07` USD. Totals use Python integers and can exceed that amount.
+for example `12`, `12.3`, or `12.34`. Leading zeros do not change the value
+(`0001.02` is $1.02). Zero, negative values, scientific notation, commas,
+currency symbols, non-finite values, and extra decimal places are rejected
+rather than silently rounded. Strings longer than 128 characters are rejected
+before parsing. One transaction can contain at most `92233720368547758.07` USD.
+Totals use Python integers and can exceed that amount.
 All transactions in a database are interpreted as USD; do not mix currencies.
 
 ## Where data lives
@@ -76,8 +94,9 @@ only after commit. Concurrent writers wait up to five seconds, then return a
 nonzero exit code if the database remains locked. Invalid inputs are rejected
 before writing. Corrupt files, unsupported database versions/schemas, unexpected
 triggers, invalid stored records, directory paths, and final-component symlinks
-are rejected instead of being silently replaced or repaired. An empty SQLite
-file can be initialized as a new ledger.
+are rejected instead of being silently replaced or repaired. An empty or
+uninitialized SQLite file is an empty ledger: `list` and `summary` succeed and
+leave it unchanged, and the next successful write initializes it.
 
 Use a trusted, local directory and filesystem. Concurrent file replacement,
 untrusted directory access, network/synchronized filesystem locking, disk failure,
@@ -105,18 +124,21 @@ records you trust.
 
 ```bash
 python -m pip install '.[dev]' build
+python -m ruff check .
 python -m pytest
 python -m build
 # In a separate virtual environment, install the generated wheel:
-python -m pip install dist/budget_tracker-0.2.0-py3-none-any.whl
+python -m pip install dist/budget_tracker-0.2.1-py3-none-any.whl
 python scripts/wheel_smoke.py
 ```
 
 Tests cover independent-process persistence, concurrent writers, exact decimal
 amounts and large totals, validation, literal category text, schema/corruption
-rejection, write locks, a failed commit, and simulated disk-full errors. CI is
-configured for Python 3.8, 3.12, and 3.14 on Linux, and Python 3.12 on macOS and
-Windows. A configured job is not evidence that it has run successfully.
+rejection, write locks, a failed commit, and simulated disk-full errors. They
+also cover uninitialized database files, leading zeros in amounts, full category
+names in `summary`, and `--category` filters. CI runs Ruff and pytest on Python
+3.8, 3.12, and 3.14 on Linux, and on Python 3.12 on macOS and Windows. A
+configured job is not evidence that it has run successfully.
 
 ## License
 
