@@ -1,18 +1,26 @@
 import hashlib
+import io
 import os
-from pathlib import Path
 import sqlite3
 import stat
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
 
 from budget_tracker import __version__
-from budget_tracker.cli import main
+from budget_tracker.cli import main, print_category_table
 from budget_tracker.storage import (
-    APPLICATION_ID, MAX_CENTS, Ledger, LedgerError, clean_category, format_amount, parse_amount,
+    APPLICATION_ID,
+    MAX_AMOUNT_INPUT,
+    MAX_CENTS,
+    Ledger,
+    LedgerError,
+    clean_category,
+    format_amount,
+    parse_amount,
 )
 
 
@@ -326,3 +334,167 @@ def test_schema_constraints(db):
         for bad in [0, -1, 1.25]:
             with pytest.raises(sqlite3.IntegrityError):
                 connection.execute("UPDATE transactions SET amount_cents=?", (bad,))
+
+
+@pytest.mark.parametrize("text,cents", [
+    ("0001.02", 102),
+    ("000000000000000000.01", 1),
+    ("0092233720368547758.07", MAX_CENTS),
+    ("0" * 100 + ".01", 1),
+])
+def test_leading_zeros_keep_the_same_value(text, cents):
+    assert len(text) <= MAX_AMOUNT_INPUT
+    assert parse_amount(text) == cents
+
+
+def test_amount_input_cap_and_range_still_reject(db):
+    with pytest.raises(ValueError):
+        parse_amount("9" * 10000)
+    with pytest.raises(ValueError):
+        parse_amount("0" * (MAX_AMOUNT_INPUT + 1))
+    result = run(db, "expense", "92233720368547759.00")
+    assert result.exit_code != 0
+    assert "Added" not in result.output
+    assert "0.01 and" in result.output
+    assert not db.exists()
+    result = run(db, "income", "0092233720368547758.07")
+    assert result.exit_code == 0, result.output
+    assert Ledger(db).records()[0][2] == MAX_CENTS
+
+
+@pytest.mark.parametrize("value", [None, 1, b"food"])
+def test_non_string_category_is_rejected(value):
+    with pytest.raises(ValueError):
+        clean_category(value)
+
+
+def _empty_sqlite_file(path):
+    """Create a real SQLite file with no user tables and a nonempty header."""
+    connection = sqlite3.connect(str(path))
+    try:
+        connection.execute("CREATE TABLE marker (id INTEGER)")
+        connection.execute("DROP TABLE marker")
+        connection.commit()
+    finally:
+        connection.close()
+    assert path.stat().st_size > 0
+
+
+@pytest.mark.parametrize("prepare", ["zero", "header"])
+def test_uninitialized_database_reads_as_empty_and_can_be_written(tmp_path, prepare):
+    db = tmp_path / "empty.sqlite3"
+    if prepare == "zero":
+        db.write_bytes(b"")
+    else:
+        _empty_sqlite_file(db)
+    before = digest(db)
+    for command in ("summary", "list"):
+        result = run(db, command)
+        assert result.exit_code == 0, result.output
+        assert "No recorded transactions." in result.output
+        assert "Unsupported" not in result.output
+        assert "Traceback" not in result.output
+        assert digest(db) == before
+    result = run(db, "expense", "0.01", "-c", "food")
+    assert result.exit_code == 0, result.output
+    assert [row[3] for row in Ledger(db).records()] == ["food"]
+    assert Ledger(db).summary()[2] == 1
+
+
+def test_summary_shows_full_distinct_category_names(db):
+    first = "x" * 80 + "ONE"
+    second = "x" * 80 + "TWO"
+    wide = "餐" * 100
+    Ledger(db).add("expense", 100, first)
+    Ledger(db).add("income", 250, second)
+    Ledger(db).add("expense", 50, wide)
+    result = run(db, "summary", env={"COLUMNS": "40", "LINES": "10"})
+    assert result.exit_code == 0, result.output
+    assert first in result.output
+    assert second in result.output
+    assert wide in result.output
+    assert "\u2026" not in result.output
+    assert "$1.00" in result.output
+    assert "$2.50" in result.output
+    buffer = io.StringIO()
+    print_category_table(
+        {first: [0, 100], second: [250, 0], wide: [0, 50]},
+        file=buffer, force_terminal=True,
+    )
+    rendered = buffer.getvalue()
+    assert first in rendered and second in rendered and wide in rendered
+    assert "\u2026" not in rendered
+
+
+def test_category_filter_limits_list_and_summary(db):
+    assert run(db, "expense", "0.10", "-c", "food").exit_code == 0
+    assert run(db, "expense", "0.20", "-c", "food").exit_code == 0
+    assert run(db, "income", "1.00", "-c", "salary").exit_code == 0
+    listed = run(db, "list", "--category", "food")
+    assert listed.exit_code == 0, listed.output
+    assert "Category filter: food" in listed.output
+    assert "#1 | expense | $0.10 USD | food |" in listed.output
+    assert "#2 | expense | $0.20 USD | food |" in listed.output
+    assert "salary" not in listed.output
+    summary = run(db, "summary", "-c", "salary")
+    assert summary.exit_code == 0, summary.output
+    assert "Category filter: salary" in summary.output
+    assert "salary" in summary.output
+    assert "food" not in summary.output
+    assert "Recorded income: $1.00 USD" in summary.output
+    assert "Recorded expenses: $0.00 USD" in summary.output
+    assert "Recorded net: $1.00 USD" in summary.output
+    assert "Transactions: 1" in summary.output
+    missing = run(db, "list", "-c", " Food ")
+    assert missing.exit_code == 0, missing.output
+    assert "No recorded transactions for category Food." in missing.output
+    trimmed = run(db, "summary", "-c", " food ")
+    assert trimmed.exit_code == 0, trimmed.output
+    assert "Recorded expenses: $0.30 USD" in trimmed.output
+    assert "Recorded income: $0.00 USD" in trimmed.output
+    full = run(db, "summary")
+    assert "Category filter" not in full.output
+    assert "Recorded income: $1.00 USD" in full.output
+    assert "Recorded expenses: $0.30 USD" in full.output
+    assert "food" in full.output and "salary" in full.output
+    grouped, income, expenses, count = Ledger(db).summary("food")
+    assert grouped == {"food": [0, 30]}
+    assert (income, expenses, count) == (0, 30, 2)
+    for command in ("list", "summary"):
+        help_text = CliRunner().invoke(main, [command, "--help"])
+        assert help_text.exit_code == 0
+        assert "--category" in help_text.output
+
+
+def test_foreign_application_id_is_not_an_empty_ledger(tmp_path):
+    db = tmp_path / "marked.sqlite3"
+    connection = sqlite3.connect(str(db))
+    connection.execute("PRAGMA application_id = 1")
+    connection.commit()
+    connection.close()
+    before = digest(db)
+    result = run(db, "summary")
+    assert result.exit_code != 0
+    assert "Unsupported" in result.output
+    assert "Traceback" not in result.output
+    assert digest(db) == before
+
+
+def test_category_filter_rejects_bad_text_and_hidden_corruption(db):
+    Ledger(db).add("expense", 100, "food")
+    before = digest(db)
+    invalid = run(db, "summary", "-c", "a\nb")
+    assert invalid.exit_code != 0
+    assert "Added" not in invalid.output
+    assert digest(db) == before
+    absent = db.parent / "missing-filter.sqlite3"
+    assert run(absent, "list", "-c", " ").exit_code != 0
+    assert not absent.exists()
+    with sqlite3.connect(str(db)) as connection:
+        connection.execute("UPDATE transactions SET created_at = 'bad date'")
+    tampered = digest(db)
+    filtered = run(db, "list", "--category", "salary")
+    assert filtered.exit_code != 0
+    assert "Traceback" not in filtered.output
+    assert digest(db) == tampered
+    assert "No recorded transactions for category salary." not in filtered.output
